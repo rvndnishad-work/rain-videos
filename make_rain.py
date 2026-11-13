@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Render one 30-second vertical rain video (1080x1920, 30 fps) with rain sound.
 
+Every video also has a thunderstorm (lightning flashes + rolling thunder), water
+dripping from a roof edge (visible drops + drip sounds) and birds tweeting.
+
 Usage:
     python3 make_rain.py            # renders the next day (counts files in videos/)
     python3 make_rain.py 7          # renders day 7
@@ -14,6 +17,7 @@ import os
 import random
 import subprocess
 import sys
+import wave
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
@@ -40,7 +44,7 @@ PRESETS = {
                  bokeh=[(255, 220, 170)], tint=(240, 235, 235)),
 }
 
-# (title, preset, rain intensity 1-3, thunder)
+# (title, preset, rain intensity 1-3, heavy thunder) - every day has thunder; True = closer and more of it
 DAYS = [
     ("Rain Over City Lights at Night 🌧️ 30 Seconds of Calm", "city", 2, False),
     ("Cozy Window Rain 🕯️ Relax in 30 Seconds", "cozy", 1, False),
@@ -75,8 +79,9 @@ DAYS = [
 ]
 
 DESCRIPTION = (
-    "30 seconds of relaxing rain to calm your mind. Loop it for sleep, study or stress relief.\n\n"
-    "#rain #rainsounds #relaxing #sleep #barish #shorts"
+    "30 seconds of relaxing rain with distant thunder, water dripping from the roof and birdsong "
+    "to calm your mind. Loop it for sleep, study or stress relief.\n\n"
+    "#rain #rainsounds #thunderstorm #birdsong #relaxing #sleep #barish #shorts"
 )
 
 
@@ -164,11 +169,97 @@ def rain_layer(rng, count, length, width, alpha, blur, slant):
     return np.asarray(img, np.uint16)
 
 
+SR = 44100
+EAVE_H = 64          # height of the roof edge drawn along the top of the frame
+DROP_G = 5.0         # px/frame^2, so a drop crosses the frame in ~0.9 s
+
+
+def drip_schedule(rng, total):
+    """Roof drips: a few fixed spots along the eave, each releasing drops at its own uneven pace.
+
+    Returns [(release_frame, x, pitch)].
+    """
+    drops = []
+    for _ in range(rng.randint(5, 7)):
+        x = rng.randint(60, W - 60)
+        period = rng.uniform(1.1, 2.8) * FPS
+        pitch = rng.uniform(0.8, 1.35)
+        t = rng.uniform(0, period)
+        while t < total:
+            drops.append((int(t), x, pitch))
+            t += period * rng.uniform(0.7, 1.4)
+    return sorted(drops)
+
+
+def drop_sprite():
+    """A soft teardrop, brighter at the bottom."""
+    h, w = 48, 18
+    yy, xx = np.mgrid[0:h, 0:w]
+    cx, r = (w - 1) / 2, 1.5 + 6.5 * (yy / (h - 1)) ** 1.5
+    a = np.clip(1 - np.abs(xx - cx) / r, 0, 1) * np.clip((h - yy) / 5, 0, 1)
+    return (a * 255).astype(np.uint16)
+
+
+def add_eave(bg, p):
+    """Dark roof edge along the top with a faint wet highlight on its lower lip."""
+    dark = np.array(p["top"], np.float32) * 0.18
+    bg[:EAVE_H] = dark.astype(np.uint16)
+    bg[EAVE_H:EAVE_H + 3] = np.minimum(bg[EAVE_H:EAVE_H + 3] + 55, 255)
+    return bg
+
+
+def extras_audio(rng, drops, path):
+    """Synthesise the drip and bird sounds into a mono WAV at `path`."""
+    n = SR * SECONDS
+    out = np.zeros(n + SR, np.float32)
+
+    def put(t0, sig):
+        i = int(t0 * SR)
+        if 0 <= i < n:
+            out[i:i + len(sig)] += sig[:len(out) - i]
+
+    # drips: a short rising "plink" when each drop lands
+    fall = math.sqrt(2 * (H - EAVE_H) / DROP_G) / FPS
+    for f, x, pitch in drops:
+        d = rng.uniform(0.09, 0.14)
+        t = np.arange(int(d * SR)) / SR
+        f0 = 620 * pitch * rng.uniform(0.95, 1.05)
+        freq = f0 * (1 + 1.6 * (t / d) ** 0.6)
+        sig = np.sin(2 * np.pi * np.cumsum(freq) / SR) * np.exp(-t * 38) * np.minimum(t / 0.003, 1)
+        put(f / FPS + fall, (sig * rng.uniform(0.30, 0.46)).astype(np.float32))
+
+    # birds: a few phrases of quick chirps, two "birds" with their own pitch range
+    t_phrase = rng.uniform(1.0, 2.5)
+    while t_phrase < SECONDS - 3:
+        base = rng.choice([rng.uniform(2600, 3300), rng.uniform(3800, 4800)])
+        gain = rng.uniform(0.15, 0.24)
+        tn = t_phrase
+        for _ in range(rng.randint(3, 7)):
+            d = rng.uniform(0.06, 0.16)
+            t = np.arange(int(d * SR)) / SR
+            u = t / d
+            sweep = rng.choice([-1, 1]) * rng.uniform(0.15, 0.45)
+            freq = base * rng.uniform(0.9, 1.15) * (1 + sweep * (u - 0.5)) \
+                * (1 + 0.04 * np.sin(2 * np.pi * rng.uniform(25, 45) * t))
+            ph = 2 * np.pi * np.cumsum(freq) / SR
+            sig = (np.sin(ph) + 0.25 * np.sin(2 * ph)) * np.sin(np.pi * u) ** 2
+            put(tn, (sig * gain).astype(np.float32))
+            tn += d + rng.uniform(0.03, 0.12)
+        t_phrase = tn + rng.uniform(1.5, 4.5)
+
+    pcm = (np.clip(out[:n], -1, 1) * 32767).astype("<i2")
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(pcm.tobytes())
+
+
 def render(day, frames_dir=None):
     title, preset, intensity, thunder = DAYS[(day - 1) % len(DAYS)]
     p = PRESETS[preset]
     rng = random.Random(1000 + day)
-    bg = build_background(p, rng)
+    bg = add_eave(build_background(p, rng), p)
     slant = rng.uniform(0.04, 0.16)
     n = {1: 500, 2: 900, 3: 1500}[intensity]
     # (tile, speed px/frame) for far, mid and near rain; speeds divide evenly so the clip loops
@@ -179,7 +270,11 @@ def render(day, frames_dir=None):
     ]
     tint = np.array(p["tint"], np.float32)[None, None, :] / 255.0
     total = FPS * SECONDS
-    flashes = sorted(rng.sample(range(60, total - 60), 3)) if thunder else []
+    flashes = sorted(rng.sample(range(60, total - 150), 3 if thunder else 2))
+    fx = random.Random(5000 + day)   # separate stream so the rain itself is unchanged
+    drops = drip_schedule(fx, total)
+    sprite = drop_sprite()
+    sh, sw = sprite.shape
 
     def frame(i):
         rain = np.zeros((H, W), np.uint16)
@@ -187,7 +282,23 @@ def render(day, frames_dir=None):
             dy = (i * speed) % H
             dx = int(dy * slant) % W
             rain += np.roll(np.roll(tile, dy, axis=0), dx, axis=1)
+        rain[:EAVE_H] = 0   # the roof keeps the rain off itself
         out = bg + (rain[..., None] * tint).astype(np.uint16)
+        for f, x, _ in drops:
+            k = i - f
+            if k < -12 or k > 40:
+                continue
+            if k < 0:   # bead swelling on the lip of the roof before it lets go
+                y, sc = EAVE_H - sh + 10, (k + 12) / 12
+            else:
+                y, sc = EAVE_H - sh + 10 + int(0.5 * DROP_G * k * k), 1.0
+            if y >= H:
+                continue
+            y0, y1 = max(y, EAVE_H), min(y + sh, H)
+            if y1 <= y0:
+                continue
+            x0 = x - sw // 2
+            out[y0:y1, x0:x0 + sw] += (sprite[y0 - y:y1 - y, :, None] * sc).astype(np.uint16)
         for f in flashes:
             k = i - f
             if 0 <= k < 14:
@@ -204,22 +315,27 @@ def render(day, frames_dir=None):
     final = os.path.join(OUT_DIR, f"day{day:03d}.mp4")
     tmp = os.path.join(OUT_DIR, f"day{day:03d}.tmp.mp4")
     vol = {1: 0.5, 2: 0.7, 3: 0.9}[intensity]
+    wav = os.path.join(OUT_DIR, f"day{day:03d}.tmp.wav")
+    extras_audio(fx, drops, wav)
+    tvol = 5 if thunder else 3.2
     audio = (f"anoisesrc=color=pink:duration={SECONDS}:seed={day}:amplitude=0.9,"
              f"highpass=f=500,lowpass=f=9000,volume={vol}[r];"
              f"anoisesrc=color=brown:duration={SECONDS}:seed={day + 99}:amplitude=0.9,"
              f"lowpass=f=350,volume=0.35[b]")
-    mix = "[r][b]"
-    nmix = 2
+    audio += ";[1:a]aresample=44100[x]"
+    mix = "[r][b][x]"
+    nmix = 3
     for j, f in enumerate(flashes):
         t0 = f / FPS + 0.4
         audio += (f";anoisesrc=color=brown:duration=4:seed={day + j}:amplitude=1,lowpass=f=140,"
-                  f"afade=t=in:d=0.15,afade=t=out:st=0.6:d=3.4,volume=5,adelay={int(t0 * 1000)}:all=1[t{j}]")
+                  f"afade=t=in:d=0.15,afade=t=out:st=0.6:d=3.4,volume={tvol},adelay={int(t0 * 1000)}:all=1[t{j}]")
         mix += f"[t{j}]"
         nmix += 1
     audio += (f";{mix}amix=inputs={nmix}:normalize=0:duration=first,"
               f"afade=t=in:d=1,afade=t=out:st={SECONDS - 1.5}:d=1.5,alimiter=limit=0.9[a]")
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
+           "-i", wav,
            "-filter_complex", audio, "-map", "0:v", "-map", "[a]",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-maxrate", "6M", "-bufsize", "12M",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
@@ -228,7 +344,9 @@ def render(day, frames_dir=None):
     for i in range(total):
         proc.stdin.write(frame(i).tobytes())
     proc.stdin.close()
-    if proc.wait() != 0:
+    rc = proc.wait()
+    os.remove(wav)
+    if rc != 0:
         raise SystemExit("ffmpeg failed")
     os.replace(tmp, final)
     return dict(day=day, file=os.path.relpath(final, ROOT), title=title, description=DESCRIPTION)
